@@ -19,13 +19,41 @@ val APP_UUID: UUID = UUID.fromString("7c1d6c3a-5e0f-4e0e-9b53-3d6e0b2a8f11")
 object Bt {
     fun adapter(ctx: Context): BluetoothAdapter? = ctx.getSystemService(BluetoothManager::class.java)?.adapter
 
-    /** Opens a Bluetooth link from the VIDEO phone to the AUDIO phone (already paired in Android settings). */
+    /** Tries to switch Bluetooth on silently. Returns false if Android refuses (then a system prompt is needed). */
+    @Suppress("DEPRECATION")
+    fun tryEnable(ctx: Context): Boolean = try {
+        val a = adapter(ctx)
+        a != null && (a.isEnabled || a.enable())
+    } catch (_: Exception) { false }
+
+    /** Blocks (call from a worker thread) until Bluetooth is fully on. */
+    fun waitOn(ctx: Context, timeoutMs: Long): Boolean {
+        val a = adapter(ctx) ?: return false
+        val end = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < end) {
+            if (a.state == BluetoothAdapter.STATE_ON) return true
+            try { Thread.sleep(250) } catch (_: InterruptedException) { break }
+        }
+        return a.state == BluetoothAdapter.STATE_ON
+    }
+
+    /**
+     * Opens a Bluetooth link from the VIDEO phone to the AUDIO phone (already paired in Android settings).
+     * Turns Bluetooth on first if it is off, and retries longer right after switching it on.
+     */
     fun connect(ctx: Context, mac: String): Link {
         val a = adapter(ctx) ?: throw IOException("This phone has no Bluetooth")
-        if (!a.isEnabled) throw IOException("Turn Bluetooth on")
+        var fresh = false
+        if (a.state != BluetoothAdapter.STATE_ON) {
+            if (a.state == BluetoothAdapter.STATE_OFF && !tryEnable(ctx))
+                throw IOException("Bluetooth is off - switch it on and try again")
+            if (!waitOn(ctx, 15000)) throw IOException("Bluetooth did not turn on")
+            fresh = true
+            Thread.sleep(1500)          // let the stack settle before the first connect
+        }
         val dev = a.getRemoteDevice(mac)
         var last = ""
-        repeat(4) {
+        repeat(if (fresh) 8 else 5) {
             var s: BluetoothSocket? = null
             try {
                 s = dev.createRfcommSocketToServiceRecord(APP_UUID)
@@ -34,7 +62,7 @@ object Bt {
             } catch (e: Exception) {
                 last = e.message ?: ""
                 try { s?.close() } catch (_: Exception) {}
-                Thread.sleep(800)
+                Thread.sleep(if (fresh) 1200 else 800)
             }
         }
         throw IOException("Can't reach the audio phone. Is DualRec open there, and Bluetooth on? ($last)")

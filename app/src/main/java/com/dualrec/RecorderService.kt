@@ -17,6 +17,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.view.WindowManager
 import android.widget.Toast
 import java.io.File
@@ -27,6 +29,8 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
+private const val MB = 1024L * 1024L
+
 /** VIDEO phone: records the screen (no audio), then pulls the audio phone's recording over Bluetooth and merges. */
 class RecorderService : Service() {
     private val main = Handler(Looper.getMainLooper())
@@ -34,8 +38,10 @@ class RecorderService : Service() {
     private var mr: MediaRecorder? = null
     private var vd: VirtualDisplay? = null
     private var starter: Thread? = null
+    private var wl: PowerManager.WakeLock? = null
     private val stopping = AtomicBoolean(false)
     @Volatile private var bStarted = false
+    @Volatile private var watching = false
     private var offsetUs = 0L
     private var mac = ""
     private var nudge = 0L
@@ -52,16 +58,32 @@ class RecorderService : Service() {
         return START_NOT_STICKY
     }
 
+    override fun onDestroy() {
+        watching = false
+        try { if (wl?.isHeld == true) wl?.release() } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
     private fun stopSelfIfIdle() { if (!Rec.running) stopSelf() }
 
     private fun start(i: Intent) {
         Rec.running = true
+        Rec.saving = false
+        Rec.startedAt = 0L
+        Rec.status = "Starting…"
         val p = getSharedPreferences("d", MODE_PRIVATE)
         mac = p.getString("mac", "") ?: ""
         nudge = p.getLong("nudge", 0L)
         stopping.set(false)
         bStarted = false
         startForeground(1, note("Starting…", true), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        Rec.changed(this)
+
+        // keep the CPU awake for the whole (1-2 hour) recording, even if the screen dims
+        try {
+            wl = getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "dualrec:rec").also { it.acquire(6 * 60 * 60 * 1000L) }
+        } catch (_: Exception) {}
 
         try {
             @Suppress("DEPRECATION")
@@ -78,10 +100,15 @@ class RecorderService : Service() {
             return
         }
 
+        if (cacheDir.usableSpace < 4096 * MB) {
+            fail("Not enough free storage (keep at least 4 GB free; a 1 hour call needs ~8 GB)")
+            return
+        }
+
         starter = thread {
             try {
                 status("Connecting to the audio phone…")
-                val l = Bt.connect(this, mac)
+                val l = Bt.connect(this, mac)        // switches Bluetooth on first if needed
                 val off: Long
                 val tb: Long
                 try {
@@ -94,7 +121,10 @@ class RecorderService : Service() {
                 startCapture()
                 val ta = System.currentTimeMillis()                    // this phone's clock when the screen recording started
                 offsetUs = (ta - (tb - off) - nudge) * 1000L           // how far into the audio the first video frame lies
+                Rec.startedAt = SystemClock.elapsedRealtime()
                 status("● Recording")
+                Rec.changed(this)
+                watchStorage()
             } catch (e: Exception) {
                 fail("Couldn't start: ${e.message}")
             }
@@ -118,6 +148,8 @@ class RecorderService : Service() {
         r.setVideoFrameRate(30)
         r.setVideoEncodingBitRate(8_000_000)
         r.setOutputFile(video.path)
+        // if the encoder dies (disk full, etc.) save what we have instead of losing everything
+        r.setOnErrorListener { _, _, _ -> stopFlow() }
         r.prepare()
         vd = proj!!.createVirtualDisplay(
             "dualrec", w, h, resources.displayMetrics.densityDpi,
@@ -127,8 +159,27 @@ class RecorderService : Service() {
         mr = r
     }
 
+    /** Every 15 s: if free space is nearly gone, stop & save now (merging needs about as much space as the video itself). */
+    private fun watchStorage() {
+        watching = true
+        thread(isDaemon = true) {
+            while (watching && !stopping.get()) {
+                try { Thread.sleep(15000) } catch (_: InterruptedException) { break }
+                if (!watching || stopping.get()) break
+                if (cacheDir.usableSpace < video.length() + 700 * MB) {
+                    Rec.status = "Storage almost full - saving now"
+                    stopFlow()
+                    break
+                }
+            }
+        }
+    }
+
     private fun stopFlow() {
         if (!stopping.compareAndSet(false, true)) return
+        watching = false
+        Rec.saving = true
+        Rec.changed(this)
         thread {
             try {
                 starter?.join(30000)
@@ -150,19 +201,36 @@ class RecorderService : Service() {
                 if (audio.length() < 1000) haveAudio = false
 
                 status("Saving video…", false)
-                val out = File(cacheDir, "final.mp4")
-                Merger.merge(video, if (haveAudio) audio else null, offsetUs, out)
                 val name = "Call_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
-                Saver.toGallery(this, out, name)
+                // merge straight into the gallery file: no extra multi-GB temp copy
+                val uri = Saver.create(this, name)
+                try {
+                    val pfd = contentResolver.openFileDescriptor(uri, "rw") ?: throw IOException("Can't open gallery file")
+                    pfd.use { Merger.merge(video, if (haveAudio) audio else null, offsetUs, it.fileDescriptor) }
+                    Saver.publish(this, uri)
+                } catch (e: Exception) {
+                    Saver.discard(this, uri)
+                    throw e
+                }
+                video.delete()
+                audio.delete()
                 done(if (haveAudio) "Saved ✔  Gallery → Movies/DualRec" else "Saved VIDEO ONLY (couldn't get audio from the audio phone)")
             } catch (e: Exception) {
-                done("Failed: ${e.message}")
+                // last resort: never lose the screen video
+                val rescued = try {
+                    if (video.exists() && video.length() > 1000) {
+                        Saver.copy(this, video, "Call_RAW_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4")
+                        true
+                    } else false
+                } catch (_: Exception) { false }
+                done(if (rescued) "Merge failed (${e.message}) - saved the raw screen video to Movies/DualRec" else "Failed: ${e.message}")
             }
         }
     }
 
     private fun fail(msg: String) {
         stopping.set(true)
+        watching = false
         if (bStarted) {
             try { Bt.connect(this, mac).use { it.stop(audio) { } } } catch (_: Exception) {}
         }
@@ -180,11 +248,17 @@ class RecorderService : Service() {
     }
 
     private fun done(msg: String) {
+        watching = false
         Rec.status = msg
         Rec.running = false
+        Rec.saving = false
+        Rec.startedAt = 0L
+        try { if (wl?.isHeld == true) wl?.release() } catch (_: Exception) {}
+        wl = null
         main.post { Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show() }
         stopForeground(STOP_FOREGROUND_REMOVE)
-        getSystemService(NotificationManager::class.java).notify(2, note(msg, false))
+        getSystemService(NotificationManager::class.java).notify(2, doneNote(msg))
+        Rec.changed(this)
         starter = null
         stopSelf()
     }
@@ -194,19 +268,46 @@ class RecorderService : Service() {
         getSystemService(NotificationManager::class.java).notify(1, note(msg, withStop))
     }
 
+    /**
+     * Ongoing notification on a MIN-importance channel: no status-bar icon, no pop-up, nothing on the lock screen,
+     * so it doesn't end up in the recorded video. (New channel id: Android keeps the importance of an old one.)
+     */
     private fun note(text: String, withStop: Boolean): Notification {
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel("rec", "Recording", NotificationManager.IMPORTANCE_LOW))
-        val b = Notification.Builder(this, "rec")
-            .setSmallIcon(android.R.drawable.ic_media_play)
+        nm.createNotificationChannel(
+            NotificationChannel("rec_silent", "Recording (silent)", NotificationManager.IMPORTANCE_MIN).apply { setShowBadge(false) }
+        )
+        val b = Notification.Builder(this, "rec_silent")
+            .setSmallIcon(R.drawable.ic_stat_rec)
             .setContentTitle("DualRec")
             .setContentText(text)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setVisibility(Notification.VISIBILITY_SECRET)
+        if (withStop && Rec.startedAt > 0) {
+            b.setUsesChronometer(true).setShowWhen(true)
+                .setWhen(System.currentTimeMillis() - (SystemClock.elapsedRealtime() - Rec.startedAt))
+        }
         if (withStop) {
             val pi = PendingIntent.getService(
                 this, 0, Intent(this, RecorderService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE
             )
-            b.addAction(Notification.Action.Builder(Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Stop & save", pi).build())
+            b.addAction(Notification.Action.Builder(Icon.createWithResource(this, R.drawable.ic_stat_rec), "Stop & save", pi).build())
         }
         return b.build()
+    }
+
+    private fun doneNote(text: String): Notification {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel("rec_done", "Recording result", NotificationManager.IMPORTANCE_LOW))
+        val open = PendingIntent.getActivity(this, 2, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        return Notification.Builder(this, "rec_done")
+            .setSmallIcon(R.drawable.ic_stat_rec)
+            .setContentTitle("DualRec")
+            .setContentText(text)
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
     }
 }

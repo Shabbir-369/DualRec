@@ -139,10 +139,10 @@ class AudioService : Service() {
             this, 1, Intent(this, AudioService::class.java).setAction("QUIT"), PendingIntent.FLAG_IMMUTABLE
         )
         return Notification.Builder(this, "aud")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(R.drawable.ic_stat_rec)
             .setContentTitle("DualRec audio phone")
             .setContentText("Listening for the video phone")
-            .addAction(Notification.Action.Builder(Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Quit", pi).build())
+            .addAction(Notification.Action.Builder(Icon.createWithResource(this, R.drawable.ic_stat_rec), "Quit", pi).build())
             .build()
     }
 }

@@ -11,10 +11,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:label="DualRec"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@android:style/Theme.Material.NoActionBar">
 
         <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
             <intent-filter>
@@ -23,17 +26,31 @@
             </intent-filter>
         </activity>
 
+        <!-- Invisible one-tap entry point (widget / Quick Settings tile / big button) -->
+        <activity android:name=".QuickStartActivity" android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode" />
+
         <service android:name=".RecorderService" android:exported="false"
             android:foregroundServiceType="mediaProjection" />
         <service android:name=".AudioService" android:exported="false"
             android:foregroundServiceType="microphone" />
 
         <service android:name=".RecTile" android:exported="true" android:label="Dual Rec"
-            android:icon="@android:drawable/ic_media_play"
+            android:icon="@drawable/ic_tile"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
         </service>
+
+        <receiver android:name=".RecWidget" android:exported="true" android:label="Dual Rec">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/rec_widget_info" />
+        </receiver>
     </application>
 </manifest>
