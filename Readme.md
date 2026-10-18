@@ -1,5 +1,8 @@
 # DualRec
-
+  ![Android](https://img.shields.io/badge/Android-11%2B-3DDC84?logo=android&logoColor=white)
+  ![Kotlin](https://img.shields.io/badge/Kotlin-1.9-7F52FF?logo=kotlin&logoColor=white)
+  ![License](https://img.shields.io/github/license/Shabbir-369/DualRec)
+  [![Download APK](https://img.shields.io/badge/Download-APK-red)](https://github.com/Shabbir-369/DualRec/releases/latest/download/DualRec.apk)
 Record a video call's **screen** on one phone and its **sound** on a second phone, then merge both into a single MP4 automatically. One tap to start.
 
 Built for situations where the call app's own audio can't be captured: the audio phone sits next to the video phone's loudspeaker and records the voices, while the video phone records the screen. The two recordings are synced over Bluetooth and muxed together with no re-encoding.
