@@ -29,7 +29,8 @@ Built for situations where the call app's own audio can't be captured: the audio
 - **One-tap recording** on the video phone: turns Bluetooth on if it's off, connects to the audio phone, starts both recordings.
 - **Three ways to start/stop:** big in-app button, home-screen **widget** (with live timer), or **Quick Settings tile**.
 - **Automatic sync:** clock offset between the phones is measured over Bluetooth, so audio lines up with the video. A ±50 ms fine-tune is available in Settings.
-- **Built for long recordings (1–2 hours):** wake lock, storage checks, direct-to-gallery merge, and a fallback that saves the raw screen video if merging ever fails.
+- **Built for long recordings (1–2 hours):** wake lock, storage checks, and the screen recording is cut into finished ~1.8 GB parts so a long call never hits MP4 size limits and a crash can only affect the newest part.
+- **Never loses a recording:** every recording is kept in its own safe folder inside the app until the merged file has been re-opened and verified, or the raw files have been copied to your gallery. If merging fails, the screen video and the audio are saved **separately**, and a **Recover** card appears in the app if anything is still unsaved.
 - **Stays out of the video:** the app's own screen is blacked out in recordings, and its notification has no status-bar icon.
 - **No re-encoding:** video and audio are muxed as-is, so merging is fast and lossless.
 - Dark, responsive UI and an adaptive app icon (themed-icon support included).
@@ -100,6 +101,15 @@ You only do this once per phone.
 - Audio transfer at the end happens over classic Bluetooth, so a 2-hour recording can take several minutes to fetch. Don't close the app or turn Bluetooth off while it says "Getting audio over Bluetooth…".
 - If voices sound slightly early or late in a test clip, adjust **Settings → Fine-tune sync** (+ delays the audio, − makes it earlier).
 
+## If something goes wrong
+
+DualRec only deletes its working files after one of these is true: the merged video was re-opened and checked, or every file was copied to your phone's storage and its size verified. Nothing is deleted before that.
+
+- Screen video: **Movies/DualRec** (`Call_<date>_screen.mp4`, or `_screen_part1/2/…` for long recordings; play the parts in order).
+- Audio: **Music/DualRec** (`Call_<date>_audio.m4a`).
+- Log: **Download/DualRec** (`Call_<date>_log.txt`). Share it when reporting a problem.
+- The audio phone keeps its last recording until the next one starts, so use **Save last audio recording to phone** there if the audio never arrived.
+
 ## What's hidden from the recording
 
 - DualRec's own screen is blacked out (it uses `FLAG_SECURE`; this also blocks screenshots of the app).
@@ -113,8 +123,9 @@ You only do this once per phone.
 | "Can't reach the audio phone" | Open DualRec on the audio phone and make sure it says **Listening** and Bluetooth is on. Use *Settings → Test Bluetooth connection* on the video phone. |
 | Android asks "Allow DualRec to turn on Bluetooth?" | Some phones don't allow silent switch-on. Tap Allow; the rest stays automatic. |
 | Audio phone stops listening after a while | Allow background running and disable battery restrictions for DualRec (see setup step 2). |
-| Saved "VIDEO ONLY" | The audio couldn't be fetched. Check Bluetooth, and record again. |
-| "Merge failed … saved the raw screen video" | The raw video is in Movies/DualRec. Free some storage and try again; the audio is lost in this case. |
+| Saved "VIDEO ONLY" | The audio couldn't be fetched over Bluetooth. It is still on the audio phone: open DualRec there and tap **Save last audio recording to phone** (before recording again). |
+| "Couldn't merge … saved separately" | Screen video is in **Movies/DualRec**, audio in **Music/DualRec**, and a `…_log.txt` in **Download/DualRec** says what went wrong. |
+| Orange **Unsaved recording found** card | Something wasn't saved yet (e.g. low storage). It is safe inside the app. Free some space and tap **Merge & save**, or **Save the raw files separately**. |
 | Audio out of sync | Adjust *Fine-tune sync* in Settings. |
 
 ## Permissions

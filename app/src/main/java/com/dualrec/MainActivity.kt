@@ -212,6 +212,21 @@ class MainActivity : Activity() {
         root.addView(statusTv, lp())
         root.addView(spacer(1f))
 
+        val leftovers = if (Rec.running) emptyList() else Sessions.list(this)
+        if (leftovers.isNotEmpty()) {
+            val gb = String.format(Locale.US, "%.1f", leftovers.sumOf { it.bytes } / 1e9)
+            root.addView(card().apply {
+                background = shape(CARD, 18, AMBER)
+                addView(label("⚠ Unsaved recording found", 15f, AMBER, true))
+                addView(label(
+                    "${leftovers.size} recording(s), $gb GB, are kept safely inside DualRec (nothing is lost). " +
+                    "Tap Merge & save. If merging isn't possible, the screen video and audio are saved separately.", 13f, SUB
+                ).apply { setPadding(0, dp(4), 0, 0) })
+                addView(button("Merge & save", ACCENT, 0xFFFFFFFF.toInt()) { recover(true) })
+                addView(button("Save the raw files separately") { recover(false) })
+            })
+        }
+
         root.addView(card().apply {
             addView(label("One-tap start", 14f, TEXT, true))
             addView(label(
@@ -297,6 +312,7 @@ class MainActivity : Activity() {
         }
         root.addView(mainBtn)
         root.addView(button("Keep running in background (recommended)") { allowBackground() })
+        root.addView(button("Save last audio recording to phone") { saveLastAudio() })
         root.addView(button("Open Bluetooth settings") { startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) })
         root.addView(label(
             "First time: pair this phone with the video phone in Android Settings → Bluetooth.\n" +
@@ -332,7 +348,7 @@ class MainActivity : Activity() {
                     it.contentDescription = when (st) { 0 -> "Start recording"; 1 -> "Please wait"; else -> "Stop and save" }
                 }
                 timerTv?.text = if (st == 2) fmt(SystemClock.elapsedRealtime() - Rec.startedAt) else " "
-                statusTv?.text = if (!Rec.running && Rec.status == "Ready") "Tap the button to start recording" else Rec.status
+                statusTv?.text = if (!Rec.running && !Rec.recovering && Rec.status == "Ready") "Tap the button to start recording" else Rec.status
                 btChip?.let {
                     val on = Bt.adapter(this)?.isEnabled == true
                     it.text = if (on) "● Bluetooth on" else "○ Bluetooth off"
@@ -360,8 +376,44 @@ class MainActivity : Activity() {
     }
 
     // ---------- actions ----------
+
+    private fun recover(merge: Boolean) {
+        if (Rec.recovering || Rec.running) return
+        Rec.recovering = true
+        Rec.status = "Recovering…"
+        thread {
+            RecLog.clear()
+            var msg = "Nothing to recover"
+            try {
+                for (s in Sessions.list(this)) {
+                    msg = if (merge) Recovery.finish(this, s) { Rec.status = it } else Recovery.saveRaw(this, s) { Rec.status = it }
+                }
+            } catch (e: Throwable) {
+                msg = "Recovery problem: ${e.message}. Your files are still kept inside DualRec."
+            }
+            Rec.status = msg
+            Rec.recovering = false
+            toast(msg)
+            runOnUiThread { render() }
+        }
+    }
+
+    private fun saveLastAudio() {
+        val f = java.io.File(cacheDir, "audio_b.m4a")
+        if (!f.exists() || f.length() < 1000) { toast("No audio recording is stored on this phone"); return }
+        if (AudioService.up && AudioService.status.contains("Recording", ignoreCase = true)) { toast("Wait until the recording has stopped"); return }
+        toast("Saving…")
+        thread {
+            try {
+                val stamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(java.util.Date(f.lastModified()))
+                Saver.copyAudio(this, f, "Call_${stamp}_audio.m4a")
+                toast("Saved to Music/DualRec ✔")
+            } catch (e: Exception) { toast("Could not save: ${e.message}") }
+        }
+    }
     private fun onRec() {
         when {
+            Rec.recovering -> toast("Still saving the previous recording…")
             Rec.saving -> toast("Saving — one moment…")
             Rec.running -> startService(Intent(this, RecorderService::class.java).setAction("STOP"))
             else -> startActivityForResult(Intent(this, QuickStartActivity::class.java), 7)

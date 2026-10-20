@@ -26,10 +26,14 @@ import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 private const val MB = 1024L * 1024L
+
+/** The screen recording is cut into finished files of about this size (far below the 4 GB MP4 limit; a crash only risks the newest part). */
+private const val PART_BYTES = 1800L * MB
 
 /** VIDEO phone: records the screen (no audio), then pulls the audio phone's recording over Bluetooth and merges. */
 class RecorderService : Service() {
@@ -45,8 +49,9 @@ class RecorderService : Service() {
     private var offsetUs = 0L
     private var mac = ""
     private var nudge = 0L
-    private val video by lazy { File(cacheDir, "screen.mp4") }
-    private val audio by lazy { File(cacheDir, "audio_from_b.m4a") }
+    private var stamp = ""
+    private var session: File? = null
+    private val parts = CopyOnWriteArrayList<File>()
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -71,6 +76,7 @@ class RecorderService : Service() {
         Rec.saving = false
         Rec.startedAt = 0L
         Rec.status = "Starting…"
+        RecLog.clear()
         val p = getSharedPreferences("d", MODE_PRIVATE)
         mac = p.getString("mac", "") ?: ""
         nudge = p.getLong("nudge", 0L)
@@ -92,7 +98,7 @@ class RecorderService : Service() {
             val mpm = getSystemService(MediaProjectionManager::class.java)
             val pr = mpm.getMediaProjection(i.getIntExtra("code", 0), data)
             pr.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() { stopFlow() }
+                override fun onStop() { RecLog.add("MediaProjection stopped by Android"); stopFlow() }
             }, main)
             proj = pr
         } catch (e: Exception) {
@@ -100,10 +106,19 @@ class RecorderService : Service() {
             return
         }
 
-        if (cacheDir.usableSpace < 4096 * MB) {
-            fail("Not enough free storage (keep at least 4 GB free; a 1 hour call needs ~8 GB)")
+        val free = cacheDir.usableSpace
+        RecLog.add("start: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.SDK_INT}, free ${free / MB} MB")
+        if (free < 4096 * MB) {
+            val kept = Sessions.list(this).sumOf { it.bytes }
+            fail("Not enough free storage (keep at least 4 GB free; a 1 hour call needs ~8 GB)" +
+                if (kept > 0) ". An unsaved recording is using ${kept / MB} MB: open DualRec and tap Recover." else "")
             return
         }
+
+        stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        session = Sessions.create(this, stamp)
+        Sessions.active = session
+        parts.clear()
 
         starter = thread {
             try {
@@ -121,11 +136,13 @@ class RecorderService : Service() {
                 startCapture()
                 val ta = System.currentTimeMillis()                    // this phone's clock when the screen recording started
                 offsetUs = (ta - (tb - off) - nudge) * 1000L           // how far into the audio the first video frame lies
+                Sessions.writeMeta(session!!, offsetUs)
                 Rec.startedAt = SystemClock.elapsedRealtime()
                 status("● Recording")
                 Rec.changed(this)
                 watchStorage()
             } catch (e: Exception) {
+                RecLog.add("start failed: $e")
                 fail("Couldn't start: ${e.message}")
             }
         }
@@ -134,12 +151,15 @@ class RecorderService : Service() {
     @Suppress("DEPRECATION")
     private fun newRec(): MediaRecorder = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
 
+    private fun partFile(n: Int) = File(session!!, "screen_$n.mp4")
+
     private fun startCapture() {
         val b = getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds
         val sc = minOf(1f, 1920f / maxOf(b.width(), b.height()))
         val w = (b.width() * sc).toInt() and 1.inv()
         val h = (b.height() * sc).toInt() and 1.inv()
-        video.delete()
+        val first = partFile(1)
+        parts.add(first)
         val r = newRec()
         r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
         r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
@@ -147,9 +167,11 @@ class RecorderService : Service() {
         r.setVideoSize(w, h)
         r.setVideoFrameRate(30)
         r.setVideoEncodingBitRate(8_000_000)
-        r.setOutputFile(video.path)
+        r.setMaxFileSize(PART_BYTES)
+        r.setOutputFile(first.path)
+        r.setOnInfoListener { _, what, extra -> onRecorderInfo(what, extra) }
         // if the encoder dies (disk full, etc.) save what we have instead of losing everything
-        r.setOnErrorListener { _, _, _ -> stopFlow() }
+        r.setOnErrorListener { _, what, extra -> RecLog.add("MediaRecorder error $what/$extra"); stopFlow() }
         r.prepare()
         vd = proj!!.createVirtualDisplay(
             "dualrec", w, h, resources.displayMetrics.densityDpi,
@@ -159,6 +181,28 @@ class RecorderService : Service() {
         mr = r
     }
 
+    /** Close to the part limit: tell the recorder which file to continue in (seamless, the finished part is closed properly). */
+    private fun onRecorderInfo(what: Int, extra: Int) {
+        when (what) {
+            MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_APPROACHING -> {
+                try {
+                    val next = partFile(parts.size + 1)
+                    mr?.setNextOutputFile(next)
+                    parts.add(next)
+                    RecLog.add("next screen part armed: ${next.name}")
+                } catch (e: Exception) {
+                    RecLog.add("could not arm next part: $e")
+                }
+            }
+            MediaRecorder.MEDIA_RECORDER_INFO_NEXT_OUTPUT_FILE_STARTED -> RecLog.add("switched to next screen part")
+            MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED,
+            MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED -> {
+                RecLog.add("recorder limit reached ($what) - saving what we have")
+                stopFlow()
+            }
+        }
+    }
+
     /** Every 15 s: if free space is nearly gone, stop & save now (merging needs about as much space as the video itself). */
     private fun watchStorage() {
         watching = true
@@ -166,7 +210,8 @@ class RecorderService : Service() {
             while (watching && !stopping.get()) {
                 try { Thread.sleep(15000) } catch (_: InterruptedException) { break }
                 if (!watching || stopping.get()) break
-                if (cacheDir.usableSpace < video.length() + 700 * MB) {
+                if (cacheDir.usableSpace < parts.sumOf { it.length() } + 700 * MB) {
+                    RecLog.add("storage almost full - stopping")
                     Rec.status = "Storage almost full - saving now"
                     stopFlow()
                     break
@@ -175,55 +220,59 @@ class RecorderService : Service() {
         }
     }
 
+    private fun buildSession(audio: File?): Session =
+        Session(session!!, stamp, parts.toList(), audio?.takeIf { it.exists() && it.length() > 0 }, offsetUs, false)
+
     private fun stopFlow() {
         if (!stopping.compareAndSet(false, true)) return
         watching = false
         Rec.saving = true
         Rec.changed(this)
         thread {
+            val audio = session?.let { File(it, "audio_from_b.m4a") }
             try {
                 starter?.join(30000)
-                if (mr == null) { done("Nothing was recorded"); return@thread }
+                if (mr == null) {
+                    session?.deleteRecursively()
+                    done("Nothing was recorded")
+                    return@thread
+                }
                 status("Stopping…", false)
-                try { mr?.stop() } catch (_: Exception) {}
+                if (Rec.startedAt > 0) {
+                    val el = SystemClock.elapsedRealtime() - Rec.startedAt
+                    if (el < 3000) Thread.sleep(3000 - el)      // a clip stopped too early can end up unreadable
+                }
+                try { mr?.stop() } catch (e: Exception) { RecLog.add("MediaRecorder.stop() threw: $e") }
                 release()
 
                 var haveAudio = false
                 for (attempt in 1..4) {
                     try {
                         status("Getting audio over Bluetooth…", false)
-                        audio.delete()
+                        audio!!.delete()
                         val l = Bt.connect(this, mac)
                         try { haveAudio = l.stop(audio) { pc -> status("Getting audio over Bluetooth… $pc%", false) } } finally { l.close() }
-                        if (haveAudio && audio.length() > 1000) break
-                    } catch (_: Exception) { Thread.sleep(1500) }
+                        if (haveAudio && Merger.readable(audio, "audio/")) break
+                        RecLog.add("audio attempt $attempt: transferred=$haveAudio, check=${Merger.probe(audio, "audio/")}")
+                    } catch (e: Exception) {
+                        RecLog.add("audio attempt $attempt failed: $e")
+                        Thread.sleep(1500)
+                    }
                 }
-                if (audio.length() < 1000) haveAudio = false
 
-                status("Saving video…", false)
-                val name = "Call_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
-                // merge straight into the gallery file: no extra multi-GB temp copy
-                val uri = Saver.create(this, name)
-                try {
-                    val pfd = contentResolver.openFileDescriptor(uri, "rw") ?: throw IOException("Can't open gallery file")
-                    pfd.use { Merger.merge(video, if (haveAudio) audio else null, offsetUs, it.fileDescriptor) }
-                    Saver.publish(this, uri)
-                } catch (e: Exception) {
-                    Saver.discard(this, uri)
-                    throw e
+                val msg = Recovery.finish(this, buildSession(audio)) { status(it, false) }
+                done(msg)
+            } catch (e: Throwable) {
+                // last resort: everything is still in the session folder -> copy it out as it is
+                RecLog.add("stop pipeline crashed: $e")
+                val msg = try {
+                    release()
+                    Recovery.saveRaw(this, buildSession(audio)) { status(it, false) }
+                } catch (e2: Throwable) {
+                    "Failed (${e.message}). Your recording is kept safely inside DualRec - open the app and tap Recover."
                 }
-                video.delete()
-                audio.delete()
-                done(if (haveAudio) "Saved ✔  Gallery → Movies/DualRec" else "Saved VIDEO ONLY (couldn't get audio from the audio phone)")
-            } catch (e: Exception) {
-                // last resort: never lose the screen video
-                val rescued = try {
-                    if (video.exists() && video.length() > 1000) {
-                        Saver.copy(this, video, "Call_RAW_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4")
-                        true
-                    } else false
-                } catch (_: Exception) { false }
-                done(if (rescued) "Merge failed (${e.message}) - saved the raw screen video to Movies/DualRec" else "Failed: ${e.message}")
+                Saver.saveLog(this, "Call_${stamp}_log.txt", RecLog.text())
+                done(msg)
             }
         }
     }
@@ -232,9 +281,12 @@ class RecorderService : Service() {
         stopping.set(true)
         watching = false
         if (bStarted) {
-            try { Bt.connect(this, mac).use { it.stop(audio) { } } } catch (_: Exception) {}
+            val tmp = File(cacheDir, "discard.m4a")
+            try { Bt.connect(this, mac).use { it.stop(tmp) { } } } catch (_: Exception) {}
+            tmp.delete()
         }
         release()
+        session?.deleteRecursively()
         done(msg)
     }
 
@@ -249,6 +301,7 @@ class RecorderService : Service() {
 
     private fun done(msg: String) {
         watching = false
+        Sessions.active = null
         Rec.status = msg
         Rec.running = false
         Rec.saving = false
@@ -306,6 +359,7 @@ class RecorderService : Service() {
             .setSmallIcon(R.drawable.ic_stat_rec)
             .setContentTitle("DualRec")
             .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(open)
             .setAutoCancel(true)
             .build()

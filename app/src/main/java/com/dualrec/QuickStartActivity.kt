@@ -31,6 +31,11 @@ class QuickStartActivity : Activity() {
             finish()
             return
         }
+        if (Rec.recovering) {
+            Toast.makeText(this, "Still saving the previous recording…", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
         val ready = p.getString("role", "") == "A" && !p.getString("mac", "").isNullOrEmpty()
         if (!ready) {
             Toast.makeText(this, "Finish the one-time setup in DualRec first", Toast.LENGTH_LONG).show()
